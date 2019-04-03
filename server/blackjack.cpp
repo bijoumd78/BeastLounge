@@ -25,6 +25,71 @@ namespace {
 
 //------------------------------------------------------------------------------
 
+enum class error
+{
+    not_playing = 1,
+    already_playing,
+    already_leaving,
+    no_open_seat
+};
+
+} // (anon)
+namespace boost {
+namespace system {
+template<>
+struct is_error_code_enum<error>
+{
+    static bool constexpr value = true;
+};
+} // system
+} // boost
+namespace {
+
+class error_codes : public beast::error_category
+{
+public:
+    const char*
+    name() const noexcept override
+    {
+        return "beast-lounge.blackjack";
+    }
+
+    std::string
+    message(int ev) const override
+    {
+        switch(static_cast<error>(ev))
+        {
+        default:
+        case error::not_playing: return
+            "Not playing";
+        case error::already_playing: return
+            "Already playing";
+        case error::already_leaving: return
+            "Already playing";
+        case error::no_open_seat: return
+            "No open seat";
+        }
+    }
+
+    beast::error_condition
+    default_error_condition(
+        int ev) const noexcept override
+    {
+        return {ev, *this};
+    }
+};
+
+beast::error_code
+make_error_code(error e)
+{
+    static error_codes const cat{};
+    return {static_cast<std::underlying_type<
+        error>::type>(e), cat};
+}
+
+
+//------------------------------------------------------------------------------
+
 class shoe
 {
     std::vector<char> cards_;
@@ -164,6 +229,7 @@ struct seat
     user* u = nullptr;
     state_t state = open;
     std::vector<hand> hands;
+    int chips;
 
     seat()
     {
@@ -178,22 +244,29 @@ struct seat
         switch(state)
         {
         case dealer:
-            jv["state"] = "dealer";
+            jv.emplace("state", "dealer");
             break;
+
         case waiting:
-            jv["state"] = "waiting";
-            jv["user"] = u->name;
+            jv.emplace("state", "waiting");
+            jv.emplace("user", u->name);
+            jv.emplace("chips", chips);
             break;
+
         case playing:
-            jv["state"] = "playing";
-            jv["user"] = u->name;
+            jv.emplace("state", "playing");
+            jv.emplace("user", u->name);
+            jv.emplace("chips", chips);
             break;
+
         case leaving:
-            jv["state"] = "leaving";
-            jv["user"] = u->name;
+            jv.emplace("state", "leaving");
+            jv.emplace("user", u->name);
+            jv.emplace("chips", chips);
             break;
+
         case open:
-            jv["state"] = "open";
+            jv.emplace("state", "open");
             break;
         }
     }
@@ -201,35 +274,59 @@ struct seat
 
 //------------------------------------------------------------------------------
 
+/*  State machine for a blackjack game.
+
+    Each round evolves through a series of stages
+
+    1.  Place Bets
+
+        All players have a limited time to place valid bets.
+        The client defaults to the previous bet if any.
+        A player who doesn't bet is ejected from the seat.
+
+    2. Dealing
+
+        The first card is dealt face up to each seat 1 to 5.
+        The dealer's first card is dealt face down.
+        The second card is dealt face up to each seat 1 to 5.
+        The dealer's second card is dealt face down.
+*/
+enum class stage
+{
+    // Waiting for players
+    wait,
+
+    // Bets being placed
+    bet,
+
+    // Cards being dealt
+    deal,
+
+    // Players making choices
+    play,
+
+    // House hand playing out
+    house,
+
+    // Bets paid out or collected
+    payout,
+
+    // Deck is being shuffled
+    shuffle
+};
+
 class game
 {
-    enum what
-    {
-        under,
-        twentyone,
-        natural,
-        bust
-    };
-
     shoe shoe_;
 
     // 0    = dealer
     // 1..5 = player
     std::vector<seat> seat_;
 
+    ::stage stage_ = ::stage::wait;
+
     // which seat's turn
     int turn_ = 1;
-
-public:
-    explicit
-    game(int decks)
-        : shoe_(decks)
-    {
-        BOOST_ASSERT(
-            decks >= 1 && decks <= 6);
-        seat_.resize(6);
-        seat_[0].state = seat::dealer;
-    }
 
     std::size_t
     find(user const& u) const
@@ -254,38 +351,71 @@ public:
         return 0;
     }
 
+public:
+    explicit
+    game(int decks)
+        : shoe_(decks)
+    {
+        BOOST_ASSERT(
+            decks >= 1 && decks <= 6);
+        seat_.resize(6);
+        seat_[0].state = seat::dealer;
+    }
+
+    ::stage
+    stage() const noexcept
+    {
+        return stage_;
+    }
+
     // Join the game as a player.
-    // 1..5 = assigned seat
-    // 0 = no open seat
-    // -1 = already joined
+    // Returns seat assignment on success
     int
-    play(user& u)
+    join(
+        user& u,
+        beast::error_code& ec)
     {
         if(find(u) != 0)
-            return -1;
+        {
+            ec = error::already_playing;
+            return 0;
+        }
         for(auto& s : seat_)
         {
             if(s.state == seat::open)
             {
-                s.state = seat::waiting;
+                if(stage_ == ::stage::wait)
+                {
+                    stage_ = ::stage::bet;
+                    s.state = seat::playing;
+                }
+                else
+                {
+                    s.state = seat::waiting;
+                }
                 s.u = &u;
+                ec.clear();
                 return &s - &seat_.front();
             }
         }
+        ec = error::no_open_seat;
         return 0;
     }
 
     // Leave the game as a player.
     //  1 = now leaving, was playing
     //  2 = now open, was waiting
-    // -1 = not playing
-    // -2 = already leaving
     int
-    watch(user& u)
+    leave(
+        user& u,
+        beast::error_code& ec)
     {
         auto const i = find(u);
         if(! i)
-            return -1;
+        {
+            ec = error::not_playing;
+            return 0;
+        }
         switch(seat_[i].state)
         {
         case seat::waiting:
@@ -295,14 +425,13 @@ public:
         case seat::playing:
             seat_[i].state = seat::leaving;
             return 1;
-
-        case seat::leaving:
-            return -2;
-
+        
         default:
-            break;
+            BOOST_ASSERT(
+                seat_[i].state == seat::leaving);
+            ec = error::already_leaving;
+            return 0;
         }
-        return -3;
     }
 
     // Surrender the hand and leave
@@ -411,6 +540,10 @@ private:
         {
             post(&table::do_watch, this, std::move(rpc));
         }
+        else if(rpc.method == "bet")
+        {
+            post(&table::do_bet, this, std::move(rpc));
+        }
         else if(rpc.method == "hit")
         {
             post(&table::do_hit, this, std::move(rpc));
@@ -443,6 +576,23 @@ private:
     }
 
     void
+    on_timer(beast::error_code ec)
+    {
+        if(ec == net::error::operation_aborted)
+            return;
+
+        if(ec)
+        {
+            // log error
+            BOOST_ASSERT(! ec);
+        }
+
+
+    }
+
+    //--------------------------------------------------------------------------
+
+    void
     do_insert(boost::shared_ptr<user> sp)
     {
         json::value jv;
@@ -467,11 +617,21 @@ private:
         try
         {
             // TODO Optional seat choice
-            auto result = g_.play(*rpc.u);
-            if(result == 0)
-                rpc.fail("No open seat");
-            if(result == -1)
-                rpc.fail("Already playing");
+            beast::error_code ec;
+            bool const is_wait =
+                g_.stage() == stage::wait;
+            g_.join(*rpc.u, ec);
+            if(ec)
+                rpc.fail(ec.message());
+            if(is_wait && g_.stage() != stage::wait)
+            {
+                timer_.expires_after(
+                    std::chrono::seconds(10));
+                timer_.async_wait(
+                    beast::bind_front_handler(
+                        &table::on_timer,
+                        this));
+            }
             update("play");
             rpc.complete();
         }
@@ -486,12 +646,26 @@ private:
     {
         try
         {
-            auto result = g_.watch(*rpc.u);
-            if(result == -1)
-                rpc.fail("Not playing");
-            if(result == -2)
-                rpc.fail("Already leaving");
+            beast::error_code ec;
+            g_.leave(*rpc.u, ec);
+            if(ec)
+                rpc.fail(ec.message());
             update("watch");
+            rpc.complete();
+        }
+        catch(rpc_error const& e)
+        {
+            rpc.complete(e);
+        }
+    }
+
+    void
+    do_bet(rpc_call&& rpc)
+    {
+        try
+        {
+            //g_.bet(rpc.user);
+            update("bet");
             rpc.complete();
         }
         catch(rpc_error const& e)

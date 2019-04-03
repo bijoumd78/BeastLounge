@@ -39,6 +39,8 @@
   <button id="bj_watch">Watch</button>
   <button id="bj_leave">Leave</button>
   &nbsp;&nbsp;&nbsp;&nbsp;
+  <button id="bj_bet">Bet</button>
+  &nbsp;&nbsp;&nbsp;&nbsp;
   <button id="bj_hit">Hit</button>
   <button id="bj_stand">Stand</button>
   </div>
@@ -147,6 +149,12 @@ bj_leave.onclick = function() {
     if (ws == null) 
         return;
     ws.send_message('leave', { cid: 3 });
+}
+
+bj_bet.onclick = function() {
+    if (ws == null) 
+        return;
+    ws.send_message('bet', { cid: 3 });
 }
 
 bj_hit.onclick = function () {
