@@ -8,4 +8,4 @@
 #
 
 add_subdirectory (beast)
-add_subdirectory (server)
+#add_subdirectory (server)
